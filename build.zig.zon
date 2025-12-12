@@ -1592,5 +1592,10 @@
             .hash = "N-V-__8AAGDiRgOrXY1UJUmWSudjDbINgMaATc8MfSED6MJd",
             .lazy = true,
         },
+        .godot_3_6_2_linux_arm = .{
+            .url = "https://github.com/godotengine/godot/releases/download/3.6.2-stable/Godot_v3.6.2-stable_linux.arm32.zip",
+            .hash = "N-V-__8AACR-LQOPMURu41SpPqSGKr27Qb4loXS9TDjzkgZZ",
+            .lazy = true,
+        },
     },
 }
