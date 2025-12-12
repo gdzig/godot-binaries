@@ -1,6 +1,22 @@
 const std = @import("std");
 
-pub fn build(_: *std.Build) void {}
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const version = b.option([]const u8, "version", "Godot version constraint (default: latest)") orelse "latest";
+
+    if (executable(b, target, version)) |exe_path| {
+        const install = b.addInstallBinFile(exe_path, "godot");
+        b.getInstallStep().dependOn(&install.step);
+
+        const run = std.Build.Step.Run.create(b, "run godot");
+        run.addFileArg(exe_path);
+        if (b.args) |args| run.addArgs(args);
+        run.stdio = .inherit;
+
+        const run_step = b.step("run", "Run Godot");
+        run_step.dependOn(&run.step);
+    }
+}
 
 pub const Version = struct {
     major: u8,
@@ -149,16 +165,19 @@ fn parseDependencyName(name: []const u8) ?struct { version: Version, platform: [
 
 /// Find the Godot executable in the dependency directory
 fn findExecutable(dep: *std.Build.Dependency) ?std.Build.LazyPath {
-    var dir = dep.builder.build_root.handle.openDir(".", .{ .iterate = true }) catch return null;
+    const root_path = dep.builder.build_root.path orelse return null;
+    var dir = std.fs.openDirAbsolute(root_path, .{ .iterate = true }) catch return null;
     defer dir.close();
 
     var iter = dir.iterate();
     while (iter.next() catch return null) |entry| {
         if (entry.kind != .file) continue;
-        if (std.mem.startsWith(u8, entry.name, "Godot_v")) {
+        if (std.mem.startsWith(u8, entry.name, "Godot_v") or std.mem.startsWith(u8, entry.name, "Godot.")) {
             // Skip console executables on Windows
             if (std.mem.indexOf(u8, entry.name, "_console") != null) continue;
-            return dep.path(entry.name);
+            // Dupe the name since entry.name is a temporary buffer
+            const name = dep.builder.allocator.dupe(u8, entry.name) catch return null;
+            return dep.path(name);
         }
     }
     return null;
@@ -238,10 +257,33 @@ pub fn dependency(
     const platform_str = platformToString(plat.platform);
     const arch_str = archToString(plat.arch);
 
-    // Get self-reference to the godot package using @This()
-    const godot = b.dependencyFromBuildZig(@This(), .{});
-    const name = findMatchingDependency(godot.builder.available_deps, constraint, platform_str, arch_str);
-    return godot.builder.lazyDependency(name, .{});
+    // Get the godot package's builder - either ourselves (if root) or via dependencyFromBuildZig
+    const godot_builder = getGodotBuilder(b);
+    const name = findMatchingDependency(godot_builder.available_deps, constraint, platform_str, arch_str);
+    return godot_builder.lazyDependency(name, .{});
+}
+
+fn getGodotBuilder(b: *std.Build) *std.Build {
+    const build_runner = @import("root");
+    const deps = build_runner.dependencies;
+    const build_zig = @This();
+
+    // Check if this build.zig is a dependency in the root project
+    inline for (@typeInfo(deps.packages).@"struct".decls) |decl| {
+        const pkg_hash = decl.name;
+        const pkg = @field(deps.packages, pkg_hash);
+        if (@hasDecl(pkg, "build_zig") and pkg.build_zig == build_zig) {
+            // We're a dependency - find our name from available_deps and use dependency()
+            for (b.available_deps) |dep| {
+                if (std.mem.eql(u8, dep[1], pkg_hash)) {
+                    return b.dependency(dep[0], .{}).builder;
+                }
+            }
+        }
+    }
+
+    // We're the root package
+    return b;
 }
 
 test "Version.parse" {
