@@ -1,6 +1,6 @@
-# Godot Binaries
+# Godot Version
 
-Zig package manager distribution of Godot Engine binaries.
+Zig package manager distribution of Godot Engine binaries and header files.
 
 This repository automatically syncs Godot releases from [godotengine/godot](https://github.com/godotengine/godot) and exposes them as lazy dependencies for use in Zig projects.
 
@@ -32,7 +32,9 @@ pub fn build(b: *std.Build) void {
 | Constraint  | Meaning                 | Example Match               |
 | ----------- | ----------------------- | --------------------------- |
 | `"4.5.1"`   | Exact version           | 4.5.1 only                  |
+| `"4.5"`     | Any patch version       | 4.5.0, 4.5.1, ... (highest) |
 | `"~4.5"`    | Any patch version       | 4.5.0, 4.5.1, ... (highest) |
+| `"4"`       | Any minor/patch version | 4.0.0, 4.5.1, ... (highest) |
 | `"^4"`      | Any minor/patch version | 4.0.0, 4.5.1, ... (highest) |
 | `">=4.0.0"` | Version or higher       | 4.0.0+ (highest)            |
 | `"latest"`  | Latest available        | 4.5.1 (currently)           |
@@ -47,9 +49,19 @@ pub fn build(b: *std.Build) void {
 
 ## API
 
+### `headers(b, constraint) -> LazyPath`
+
+Returns a `LazyPath` to the directory containing `extension_api.json` and `gdextension_interface.h` for the matching version. Headers are vendored in this package, so no Godot executable download is required.
+
+```zig
+const headers = godot.headers(b, "~4.5");
+const api_json = headers.path(b, "extension_api.json");
+const interface_h = headers.path(b, "gdextension_interface.h");
+```
+
 ### `executable(b, target, constraint) -> ?LazyPath`
 
-Returns a `LazyPath` to the Godot executable matching the version constraint for the given target. Returns `null` if no match or not yet fetched.
+Returns a `LazyPath` to the Godot executable matching the version constraint for the given target. Returns `null` if the lazy dependency is not yet fetched.
 
 ### `dependency(b, target, constraint) -> ?*Dependency`
 

@@ -223,6 +223,50 @@ fn findMatchingDependency(
     return best_name orelse @panic("No Godot version found matching constraint for this platform/architecture");
 }
 
+fn findMatchingHeadersVersion(
+    available_deps: []const struct { []const u8, []const u8 },
+    constraint: Constraint,
+) Version {
+    var best_version: ?Version = null;
+
+    for (available_deps) |dep| {
+        const name = dep[0];
+        const parsed = parseDependencyName(name) orelse continue;
+
+        // Check version constraint
+        if (!constraint.matches(parsed.version)) continue;
+
+        // Keep the highest matching version
+        if (best_version == null or parsed.version.order(best_version.?) == .gt) {
+            best_version = parsed.version;
+        }
+    }
+
+    return best_version orelse @panic("No Godot version found matching constraint");
+}
+
+fn getSelfDependency(b: *std.Build, constraint_str: []const u8) *std.Build.Dependency {
+    const build_runner = @import("root");
+    const deps = build_runner.dependencies;
+    const build_zig = @This();
+
+    // Check if this build.zig is a dependency in the root project
+    inline for (@typeInfo(deps.packages).@"struct".decls) |decl| {
+        const pkg_hash = decl.name;
+        const pkg = @field(deps.packages, pkg_hash);
+        if (@hasDecl(pkg, "build_zig") and pkg.build_zig == build_zig) {
+            // We're a dependency - find our name from available_deps
+            for (b.available_deps) |dep| {
+                if (std.mem.eql(u8, dep[1], pkg_hash)) {
+                    return b.dependency(dep[0], .{ .version = constraint_str });
+                }
+            }
+        }
+    }
+
+    @panic("Could not find self as dependency");
+}
+
 /// Get a Godot executable path matching the version constraint for the given target.
 ///
 /// Constraint syntax:
@@ -250,8 +294,33 @@ pub fn executable(
     return findExecutable(dep);
 }
 
+/// Get the headers (extension_api.json and gdextension_interface.h) for a Godot version.
+///
+/// This does not require downloading the Godot executable - headers are vendored
+/// in this package.
+///
+/// Panics if no matching version exists.
+pub fn headers(
+    b: *std.Build,
+    constraint_str: []const u8,
+) std.Build.LazyPath {
+    const constraint = Constraint.parse(constraint_str) orelse
+        @panic("Invalid version constraint");
+
+    const godot_builder = getGodotBuilder(b, constraint_str);
+    const version = findMatchingHeadersVersion(godot_builder.available_deps, constraint);
+    const sub_path = b.fmt("vendor/godot_{d}_{d}_{d}", .{ version.major, version.minor, version.patch });
+
+    return .{
+        .dependency = .{
+            .dependency = getSelfDependency(b, constraint_str),
+            .sub_path = sub_path,
+        },
+    };
+}
+
 /// Get the dependency for a Godot version (if you need access to other files).
-/// Most users should use `executable()` instead.
+/// Most users should use `executable()` or `headers()` instead.
 ///
 /// Returns null only while waiting for the lazy dependency to be fetched.
 /// Panics if no matching version exists or the platform is unsupported.

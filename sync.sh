@@ -9,6 +9,35 @@ mark_lazy() {
   sed -i 's/\.hash = "\([^"]*\)",$/\.hash = "\1",\n            .lazy = true,/' build.zig.zon
 }
 
+dump_headers() {
+  local version="$1"
+  local dir="vendor/godot_${version//./_}"
+
+  if [[ -d "$dir" ]]; then
+    echo "    Headers already exist for $version"
+    return 0
+  fi
+
+  echo "    Dumping headers for $version..."
+  mkdir -p "$dir"
+
+  # 4.1.x uses --dump-extension-api, 4.2+ uses --dump-extension-api-with-docs
+  local major_minor="${version%.*}"
+  if [[ "$major_minor" == "4.1" ]]; then
+    zig build run -Dversion="$version" -- --dump-extension-api --dump-gdextension-interface --headless >/dev/null 2>&1
+  else
+    zig build run -Dversion="$version" -- --dump-extension-api-with-docs --dump-gdextension-interface --headless >/dev/null 2>&1
+  fi
+
+  if mv extension_api.json gdextension_interface.h "$dir/" 2>/dev/null; then
+    echo "    Headers dumped for $version"
+  else
+    echo "    Failed to dump headers for $version"
+    rmdir "$dir" 2>/dev/null || true
+    return 1
+  fi
+}
+
 echo "Fetching Godot releases from GitHub..."
 
 releases=$(curl -s -H "Accept: application/vnd.github.v3+json" "$API_URL")
@@ -50,14 +79,18 @@ echo "$releases" | jq -r '
   end |
   # Create dependency name: godot_4_5_0_linux_x86_64
   .dep_name = "godot_" + (.normalized_version | gsub("\\."; "_")) + "_" + .platform + "_" + .arch |
-  "\(.dep_name) \(.url)"
-' | while read -r dep_name url; do
+  "\(.dep_name) \(.url) \(.normalized_version)"
+' | while read -r dep_name url version; do
   if echo "$existing" | grep -qx "$dep_name"; then
     echo "  Skipping $dep_name (already exists)"
   else
     echo "  Adding $dep_name..."
     if zig fetch --save="$dep_name" "$url"; then
       mark_lazy
+      # Dump headers once per version (only need one platform)
+      if [[ "$dep_name" == *"_linux_x86_64" ]]; then
+        dump_headers "$version"
+      fi
     else
       echo "    Failed: $dep_name"
     fi
