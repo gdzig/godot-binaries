@@ -72,11 +72,21 @@ pub const Constraint = union(enum) {
             return .{ .gte = .{ .major = major, .minor = minor, .patch = patch } };
         }
 
-        // Exact version
+        // Version: "4" means ^4 (any 4.x.x), "4.2" means ~4.2 (any 4.2.x), "4.2.1" means exact
         var it = std.mem.splitScalar(u8, str, '.');
         const major = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
-        const minor = std.fmt.parseInt(u8, it.next() orelse return null, 10) catch return null;
-        const patch = std.fmt.parseInt(u8, it.next() orelse "0", 10) catch return null;
+        const minor_str = it.next();
+        if (minor_str == null) {
+            // No minor specified (e.g., "4") - treat as caret (any 4.x.x)
+            return .{ .caret = .{ .major = major } };
+        }
+        const minor = std.fmt.parseInt(u8, minor_str.?, 10) catch return null;
+        const patch_str = it.next();
+        if (patch_str == null) {
+            // No patch specified (e.g., "4.2") - treat as tilde (any 4.2.x)
+            return .{ .tilde = .{ .major = major, .minor = minor } };
+        }
+        const patch = std.fmt.parseInt(u8, patch_str.?, 10) catch return null;
         return .{ .exact = .{ .major = major, .minor = minor, .patch = patch } };
     }
 
@@ -258,12 +268,12 @@ pub fn dependency(
     const arch_str = archToString(plat.arch);
 
     // Get the godot package's builder - either ourselves (if root) or via dependencyFromBuildZig
-    const godot_builder = getGodotBuilder(b);
+    const godot_builder = getGodotBuilder(b, constraint_str);
     const name = findMatchingDependency(godot_builder.available_deps, constraint, platform_str, arch_str);
     return godot_builder.lazyDependency(name, .{});
 }
 
-fn getGodotBuilder(b: *std.Build) *std.Build {
+fn getGodotBuilder(b: *std.Build, constraint_str: []const u8) *std.Build {
     const build_runner = @import("root");
     const deps = build_runner.dependencies;
     const build_zig = @This();
@@ -276,7 +286,8 @@ fn getGodotBuilder(b: *std.Build) *std.Build {
             // We're a dependency - find our name from available_deps and use dependency()
             for (b.available_deps) |dep| {
                 if (std.mem.eql(u8, dep[1], pkg_hash)) {
-                    return b.dependency(dep[0], .{}).builder;
+                    // Pass the version constraint to avoid triggering default "latest" resolution
+                    return b.dependency(dep[0], .{ .version = constraint_str }).builder;
                 }
             }
         }
@@ -308,6 +319,18 @@ test "Version.order" {
 test "Constraint.parse exact" {
     const c = Constraint.parse("4.5.1").?;
     try std.testing.expectEqual(Constraint{ .exact = .{ .major = 4, .minor = 5, .patch = 1 } }, c);
+}
+
+test "Constraint.parse implicit tilde" {
+    // "4.5" without patch becomes ~4.5 (any 4.5.x)
+    const c = Constraint.parse("4.5").?;
+    try std.testing.expectEqual(Constraint{ .tilde = .{ .major = 4, .minor = 5 } }, c);
+}
+
+test "Constraint.parse implicit caret" {
+    // "4" without minor becomes ^4 (any 4.x.x)
+    const c = Constraint.parse("4").?;
+    try std.testing.expectEqual(Constraint{ .caret = .{ .major = 4 } }, c);
 }
 
 test "Constraint.parse tilde" {
