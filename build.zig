@@ -178,8 +178,7 @@ fn parseDependencyName(name: []const u8) ?struct { version: Version, platform: [
 
 /// Find the Godot executable in the dependency directory
 fn findExecutable(dep: *std.Build.Dependency) ?std.Build.LazyPath {
-    const root_path = dep.builder.build_root.path orelse return null;
-    var dir = std.fs.openDirAbsolute(root_path, .{ .iterate = true }) catch return null;
+    var dir = dep.builder.build_root.handle.openDir(".", .{ .iterate = true }) catch return null;
     defer dir.close();
 
     var iter = dir.iterate();
@@ -314,12 +313,11 @@ pub fn headers(
     const version = findMatchingHeadersVersion(godot_builder.available_deps, constraint);
     const sub_path = b.fmt("vendor/godot_{d}_{d}_{d}", .{ version.major, version.minor, version.patch });
 
-    return .{
-        .dependency = .{
-            .dependency = getSelfDependency(b),
-            .sub_path = sub_path,
-        },
-    };
+    const dep = getSelfDependency(b);
+    // Get the absolute path by resolving through the directory handle
+    const abs_path = dep.builder.build_root.handle.realpathAlloc(b.allocator, sub_path) catch
+        @panic("Failed to resolve headers path");
+    return .{ .cwd_relative = abs_path };
 }
 
 /// Get the dependency for a Godot version (if you need access to other files).
