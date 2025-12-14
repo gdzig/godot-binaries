@@ -5,6 +5,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "vendor",
     },
     .dependencies = .{
         .godot_1_0_0_linux_x86_64 = .{
