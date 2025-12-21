@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Use godot-builds repository which has ALL releases (dev, beta, rc, stable)
-# Pass PAGE=N environment variable to fetch different pages (default: 1)
-# Pass GITHUB_TOKEN=<token> to avoid rate limiting
+# Sync Godot releases from godot-builds repository to versions.zig
+#
+# Usage:
+#   ./sync.sh                    # Fetch latest 5 releases
+#   PAGE=2 ./sync.sh             # Fetch page 2
+#   LIMIT=100 ./sync.sh          # Fetch 100 releases per page
+#   GITHUB_TOKEN=xxx ./sync.sh   # Use token to avoid rate limiting
+
 PAGE="${PAGE:-1}"
 LIMIT="${LIMIT:-5}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 API_URL="https://api.github.com/repos/godotengine/godot-builds/releases?per_page=${LIMIT}&page=${PAGE}"
-
-mark_lazy() {
-  # Remove any existing .lazy lines to avoid duplicates, then add after each .hash
-  sed -i '/\.lazy = true,$/d' build.zig.zon
-  sed -i 's/\.hash = "\([^"]*\)",$/\.hash = "\1",\n            .lazy = true,/' build.zig.zon
-}
+VERSIONS_FILE="versions.zon"
 
 echo "Fetching Godot releases from GitHub (godot-builds)..."
 
@@ -30,22 +30,35 @@ if echo "$releases" | jq -e '.message' >/dev/null 2>&1; then
   exit 1
 fi
 
-# Get existing dependencies from build.zig.zon
-existing=$(grep -oE '\.godot_[a-z0-9_]+' build.zig.zon 2>/dev/null | sed 's/^\.//' | sort -u || echo "")
+# Get existing version names from versions.zon
+existing=$(grep -oE '\.godot_[a-z0-9_]+' "$VERSIONS_FILE" 2>/dev/null | sed 's/^\.//' | sort -u || echo "")
 
 echo "Processing releases..."
 
-echo "$releases" | jq -r '
+# Process releases and collect new versions
+new_versions=""
+
+while read -r dep_name url; do
+  if grep -qx "$dep_name" <<< "$existing"; then
+    echo "  Skipping $dep_name (already exists)"
+  else
+    echo "  Fetching $dep_name..."
+    if hash=$(zig fetch "$url" 2>/dev/null); then
+      new_versions+="    .$dep_name = .{ .url = \"$url\", .hash = \"$hash\" },
+"
+      echo "    Added: $dep_name"
+    else
+      echo "    Failed: $dep_name" >&2
+    fi
+  fi
+done < <(echo "$releases" | jq -r '
   .[] |
   .tag_name as $tag |
   # Parse version and prerelease from tag (e.g., "4.6-beta2" -> version="4.6", prerelease="beta2")
-  # Format: major.minor[.patch]-prerelease
   ($tag | capture("^(?<ver>[0-9]+\\.[0-9]+(\\.[0-9]+)?)-(?<pre>.+)$")) as $parsed |
   select($parsed != null) |
   $parsed.ver as $ver |
   $parsed.pre as $pre |
-  ($ver | split(".")[0] | tonumber) as $major |
-  ($ver | split(".")[1] | tonumber) as $minor |
   .assets[] |
   select(.name | test("^Godot_v.*\\.(zip)$")) |
   select(.name | test("mono|export_templates|debug_symbols|web_editor|android|godot-lib|SHA512") | not) |
@@ -76,17 +89,27 @@ echo "$releases" | jq -r '
   # Create dependency name: godot_4_6_0_beta2_linux_x86_64
   .dep_name = "godot_" + (.normalized_version | gsub("\\."; "_")) + "_" + .prerelease + "_" + .platform + "_" + .arch |
   "\(.dep_name) \(.url)"
-' | while read -r dep_name url; do
-  if grep -qx "$dep_name" <<< "$existing"; then
-    echo "  Skipping $dep_name (already exists)"
-  else
-    echo "  Adding $dep_name..."
-    if zig fetch --save="$dep_name" "$url" < /dev/null; then
-      mark_lazy
-    else
-      echo "    Failed: $dep_name"
-    fi
-  fi
-done
+')
 
-echo "Done!"
+# If we have new versions, append them to versions.zon
+if [[ -n "$new_versions" ]]; then
+  echo "Adding new versions to $VERSIONS_FILE..."
+
+  # Insert new versions before the closing "}"
+  tmp_file=$(mktemp)
+
+  # Remove the last line (}) and trailing empty lines
+  head -n -1 "$VERSIONS_FILE" > "$tmp_file"
+
+  # Append new versions
+  echo -n "$new_versions" >> "$tmp_file"
+
+  # Add back the closing
+  echo "}" >> "$tmp_file"
+
+  mv "$tmp_file" "$VERSIONS_FILE"
+
+  echo "Done! New versions added to $VERSIONS_FILE"
+else
+  echo "No new versions to add."
+fi

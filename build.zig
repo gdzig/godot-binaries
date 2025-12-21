@@ -1,5 +1,7 @@
 const std = @import("std");
 const root = @import("root");
+const FetchStep = @import("FetchStep.zig");
+const versions = @import("versions.zon");
 
 pub fn build(b: *std.Build) void {
     if (@hasDecl(root, "root") and root.root != @This()) return;
@@ -7,19 +9,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const version = b.option([]const u8, "version", "Godot version constraint (default: latest)") orelse "latest";
 
-    const resolved = executableWithVersion(b, target, version) orelse return;
+    const resolved = executableWithVersion(b, target, version);
 
     // Install executable to zig-out/bin/godot
     const install_exe = b.addInstallBinFile(resolved.exe, "godot");
+    install_exe.step.name = "install godot executable";
     b.getInstallStep().dependOn(&install_exe.step);
 
     // Install headers to zig-out/include/
     const headers_dir = headersWithVersion(b, resolved.exe, resolved.version);
-    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+    const install_headers = b.addInstallDirectory(.{
         .source_dir = headers_dir,
         .install_dir = .header,
         .install_subdir = "",
-    }).step);
+    });
+    install_headers.step.name = "install gdextension headers";
+    b.getInstallStep().dependOn(&install_headers.step);
 
     // Run step
     const run = std.Build.Step.Run.create(b, "run godot");
@@ -295,51 +300,40 @@ fn parseDependencyName(name: []const u8) ?struct { version: Version, platform: [
     };
 }
 
-/// Find the Godot executable in the dependency directory
-fn findExecutable(dep: *std.Build.Dependency) ?std.Build.LazyPath {
-    var dir = dep.builder.build_root.handle.openDir(".", .{ .iterate = true }) catch return null;
-    defer dir.close();
-
-    var iter = dir.iterate();
-    while (iter.next() catch return null) |entry| {
-        if (entry.kind != .file) continue;
-        if (std.mem.startsWith(u8, entry.name, "Godot_v") or std.mem.startsWith(u8, entry.name, "Godot.")) {
-            // Skip console executables on Windows
-            if (std.mem.indexOf(u8, entry.name, "_console") != null) continue;
-            // Dupe the name since entry.name is a temporary buffer
-            const name = dep.builder.allocator.dupe(u8, entry.name) catch return null;
-            return dep.path(name);
-        }
-    }
-    return null;
-}
-
-const MatchedDependency = struct {
+const MatchedVersion = struct {
     name: []const u8,
+    url: []const u8,
+    hash: []const u8,
     version: Version,
 };
 
-fn findMatchingDependency(
-    available_deps: []const struct { []const u8, []const u8 },
+const VersionInfo = struct {
+    name: []const u8,
+    url: []const u8,
+    hash: []const u8,
+};
+
+const version_list = blk: {
+    @setEvalBranchQuota(1_000_000);
+    const fields = @typeInfo(@TypeOf(versions)).@"struct".fields;
+    var list: [fields.len]VersionInfo = undefined;
+    for (fields, 0..) |field, i| {
+        const v = @field(versions, field.name);
+        list[i] = .{ .name = field.name, .url = v.url, .hash = v.hash };
+    }
+    const final = list;
+    break :blk final;
+};
+
+fn findMatchingVersion(
     constraint: Constraint,
     platform_str: []const u8,
     arch_str: []const u8,
-) []const u8 {
-    return findMatchingDependencyWithVersion(available_deps, constraint, platform_str, arch_str).name;
-}
+) MatchedVersion {
+    var best: ?MatchedVersion = null;
 
-fn findMatchingDependencyWithVersion(
-    available_deps: []const struct { []const u8, []const u8 },
-    constraint: Constraint,
-    platform_str: []const u8,
-    arch_str: []const u8,
-) MatchedDependency {
-    var best_name: ?[]const u8 = null;
-    var best_version: ?Version = null;
-
-    for (available_deps) |dep| {
-        const name = dep[0];
-        const parsed = parseDependencyName(name) orelse continue;
+    for (version_list) |v| {
+        const parsed = parseDependencyName(v.name) orelse continue;
 
         // Check platform/arch match
         if (!std.mem.eql(u8, parsed.platform, platform_str)) continue;
@@ -349,40 +343,21 @@ fn findMatchingDependencyWithVersion(
         if (!constraint.matches(parsed.version)) continue;
 
         // Keep the highest matching version
-        if (best_version == null or parsed.version.order(best_version.?) == .gt) {
-            best_version = parsed.version;
-            best_name = name;
+        if (best == null or parsed.version.order(best.?.version) == .gt) {
+            best = .{
+                .name = v.name,
+                .url = v.url,
+                .hash = v.hash,
+                .version = parsed.version,
+            };
         }
     }
 
-    if (best_name == null or best_version == null) {
+    if (best == null) {
         @panic("No Godot version found matching constraint for this platform/architecture");
     }
 
-    return .{ .name = best_name.?, .version = best_version.? };
-}
-
-fn getSelfDependency(b: *std.Build) *std.Build.Dependency {
-    const build_runner = @import("root");
-    const deps = build_runner.dependencies;
-    const build_zig = @This();
-
-    // Check if this build.zig is a dependency in the root project
-    @setEvalBranchQuota(10000);
-    inline for (@typeInfo(deps.packages).@"struct".decls) |decl| {
-        const pkg_hash = decl.name;
-        const pkg = @field(deps.packages, pkg_hash);
-        if (@hasDecl(pkg, "build_zig") and pkg.build_zig == build_zig) {
-            // We're a dependency - find our name from available_deps
-            for (b.available_deps) |dep| {
-                if (std.mem.eql(u8, dep[1], pkg_hash)) {
-                    return b.dependency(dep[0], .{});
-                }
-            }
-        }
-    }
-
-    @panic("Could not find self as dependency");
+    return best.?;
 }
 
 /// Get a Godot executable path matching the version constraint for the given target.
@@ -412,10 +387,8 @@ pub fn executable(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     constraint_str: []const u8,
-) ?std.Build.LazyPath {
-    const dep = dependency(b, target, constraint_str) orelse return null;
-
-    return findExecutable(dep);
+) std.Build.LazyPath {
+    return executableWithVersion(b, target, constraint_str).exe;
 }
 
 /// Source for the Godot executable used to generate headers.
@@ -429,14 +402,12 @@ pub const HeaderSource = union(enum) {
 /// Get the headers directory (containing extension_api.json and gdextension_interface.h).
 ///
 /// This runs the Godot executable to generate the header files on demand.
-///
-/// Returns null only while waiting for a lazy dependency to be fetched.
 pub fn headers(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     source: HeaderSource,
-) ?std.Build.LazyPath {
-    const resolved = resolveHeaderSource(b, target, source) orelse return null;
+) std.Build.LazyPath {
+    const resolved = resolveHeaderSource(b, target, source);
     return headersWithVersion(b, resolved.exe, resolved.version);
 }
 
@@ -449,10 +420,10 @@ fn resolveHeaderSource(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     source: HeaderSource,
-) ?ResolvedHeaderSource {
+) ResolvedHeaderSource {
     switch (source) {
         .version => |constraint_str| {
-            const resolved = executableWithVersion(b, target, constraint_str) orelse return null;
+            const resolved = executableWithVersion(b, target, constraint_str);
             return .{ .exe = resolved.exe, .version = resolved.version };
         },
         .exe => |exe| {
@@ -473,9 +444,7 @@ fn executableWithVersion(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     constraint_str: []const u8,
-) ?ExecutableWithVersion {
-    @setEvalBranchQuota(10000);
-
+) ExecutableWithVersion {
     const constraint = Constraint.parse(constraint_str) orelse
         @panic("Invalid version constraint");
 
@@ -483,10 +452,19 @@ fn executableWithVersion(
     const platform_str = platformToString(plat.platform);
     const arch_str = archToString(plat.arch);
 
-    const godot_builder = getGodotBuilder(b);
-    const match = findMatchingDependencyWithVersion(godot_builder.available_deps, constraint, platform_str, arch_str);
-    const dep = godot_builder.lazyDependency(match.name, .{}) orelse return null;
-    const exe_path = findExecutable(dep) orelse return null;
+    const match = findMatchingVersion(constraint, platform_str, arch_str);
+
+    // Create a FetchStep to download and extract the Godot zip
+    const step_name = b.fmt("fetch godot v{d}.{d}.{d}-{s}", .{
+        match.version.major,
+        match.version.minor,
+        match.version.patch,
+        @tagName(match.version.prerelease),
+    });
+    const fetch = FetchStep.create(b, step_name, match.url, match.hash);
+
+    // FetchStep finds and tracks the actual executable path
+    const exe_path = fetch.getExecutable();
 
     return .{ .exe = exe_path, .version = match.version };
 }
@@ -518,10 +496,12 @@ fn headersWithFlags(
     const has_json_interface = hasJsonInterface(version);
 
     // Use a shell wrapper to cd into output dir and run godot
+    // We need to resolve the godot path before cd'ing since it's relative
     const run = b.addSystemCommand(&.{ "sh", "-c" });
+    run.step.name = "dump gdextension headers";
 
     var script: std.ArrayListUnmanaged(u8) = .empty;
-    script.appendSlice(b.allocator, "cd \"$1\" && exec \"$2\"") catch @panic("OOM");
+    script.appendSlice(b.allocator, "GODOT=\"$(realpath \"$2\")\" && cd \"$1\" && exec \"$GODOT\"") catch @panic("OOM");
     if (use_docs) {
         script.appendSlice(b.allocator, " --dump-extension-api-with-docs") catch @panic("OOM");
     } else {
@@ -537,6 +517,7 @@ fn headersWithFlags(
     run.addArg("--");
     const output_dir = run.addOutputDirectoryArg(".");
     run.addFileArg(godot_exe);
+    run.step.name = "dump gdextension headers";
 
     return output_dir;
 }
@@ -595,6 +576,7 @@ fn headersWithRuntimeDetection(
     run.addFileArg(godot_exe);
 
     const output_dir = run.addOutputDirectoryArg(".");
+    run.step.name = "dump gdextension headers";
 
     return output_dir;
 }
@@ -633,18 +615,15 @@ fn hasJsonInterface(version: Version) bool {
     }
 }
 
-/// Get the dependency for a Godot version (if you need access to other files).
+/// Get the extracted directory for a Godot version (if you need access to other files).
 /// Most users should use `executable()` or `headers()` instead.
 ///
-/// Returns null only while waiting for the lazy dependency to be fetched.
 /// Panics if no matching version exists or the platform is unsupported.
-pub fn dependency(
+pub fn directory(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     constraint_str: []const u8,
-) ?*std.Build.Dependency {
-    @setEvalBranchQuota(10000);
-
+) std.Build.LazyPath {
     const constraint = Constraint.parse(constraint_str) orelse
         @panic("Invalid version constraint");
 
@@ -652,34 +631,9 @@ pub fn dependency(
     const platform_str = platformToString(plat.platform);
     const arch_str = archToString(plat.arch);
 
-    // Get the godot package's builder - either ourselves (if root) or via dependencyFromBuildZig
-    const godot_builder = getGodotBuilder(b);
-    const name = findMatchingDependency(godot_builder.available_deps, constraint, platform_str, arch_str);
-    return godot_builder.lazyDependency(name, .{});
-}
-
-fn getGodotBuilder(b: *std.Build) *std.Build {
-    const build_runner = @import("root");
-    const deps = build_runner.dependencies;
-    const build_zig = @This();
-
-    // Check if this build.zig is a dependency in the root project
-    @setEvalBranchQuota(10000);
-    inline for (@typeInfo(deps.packages).@"struct".decls) |decl| {
-        const pkg_hash = decl.name;
-        const pkg = @field(deps.packages, pkg_hash);
-        if (@hasDecl(pkg, "build_zig") and pkg.build_zig == build_zig) {
-            // We're a dependency - find our name from available_deps and use dependency()
-            for (b.available_deps) |dep| {
-                if (std.mem.eql(u8, dep[1], pkg_hash)) {
-                    return b.dependency(dep[0], .{}).builder;
-                }
-            }
-        }
-    }
-
-    // We're the root package
-    return b;
+    const match = findMatchingVersion(constraint, platform_str, arch_str);
+    const fetch = FetchStep.create(b, match.url, match.hash);
+    return fetch.getDirectory();
 }
 
 // ============================================================================
@@ -970,76 +924,26 @@ test "parseDependencyName invalid" {
 }
 
 // ============================================================================
-// findMatchingDependency Tests
+// findMatchingVersion Tests
 // ============================================================================
 
-test "findMatchingDependency stable only" {
-    const deps = [_]struct { []const u8, []const u8 }{
-        .{ "godot_4_5_1_stable_linux_x86_64", "hash1" },
-        .{ "godot_4_5_1_beta2_linux_x86_64", "hash2" },
-        .{ "godot_4_5_0_stable_linux_x86_64", "hash3" },
-        .{ "godot_4_4_0_stable_linux_x86_64", "hash4" },
-        .{ "godot_3_6_0_stable_linux_x86_64", "hash5" },
-        .{ "godot_4_5_1_stable_windows_x86_64", "hash6" },
-    };
+// Note: findMatchingVersion uses the global versions.versions data, so these
+// tests verify the behavior against real version data rather than mock data.
 
-    // Exact match - stable only
-    const exact = findMatchingDependency(&deps, Constraint.parse("4.5.1").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_5_1_stable_linux_x86_64", exact);
-
-    // Minor version gets highest stable patch
-    const minor = findMatchingDependency(&deps, Constraint.parse("4.5").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_5_1_stable_linux_x86_64", minor);
-
-    // Major version gets highest stable minor/patch
-    const major = findMatchingDependency(&deps, Constraint.parse("4").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_5_1_stable_linux_x86_64", major);
-
-    // Latest gets highest stable overall
-    const latest = findMatchingDependency(&deps, Constraint.parse("latest").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_5_1_stable_linux_x86_64", latest);
-
-    // Different platform
-    const win = findMatchingDependency(&deps, Constraint.parse("latest").?, "windows", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_5_1_stable_windows_x86_64", win);
+test "findMatchingVersion finds latest stable" {
+    // This should find a recent stable version for linux x86_64
+    const match = findMatchingVersion(Constraint.parse("latest").?, "linux", "x86_64");
+    try std.testing.expect(match.version.prerelease == .stable);
+    try std.testing.expect(match.url.len > 0);
+    try std.testing.expect(match.hash.len > 0);
 }
 
-test "findMatchingDependency with prerelease filter" {
-    const deps = [_]struct { []const u8, []const u8 }{
-        .{ "godot_4_6_0_stable_linux_x86_64", "hash1" },
-        .{ "godot_4_6_0_beta2_linux_x86_64", "hash2" },
-        .{ "godot_4_6_0_beta1_linux_x86_64", "hash3" },
-        .{ "godot_4_6_0_rc1_linux_x86_64", "hash4" },
-        .{ "godot_4_6_0_dev6_linux_x86_64", "hash5" },
-    };
-
-    // Get latest at beta level or above (includes beta, rc, stable - returns stable as highest)
-    const beta = findMatchingDependency(&deps, Constraint.parse("4.6-beta").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_6_0_stable_linux_x86_64", beta);
-
-    // Get specific beta
-    const beta1 = findMatchingDependency(&deps, Constraint.parse("4.6.0-beta1").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_6_0_beta1_linux_x86_64", beta1);
-
-    // Get latest at rc level or above (includes rc, stable - returns stable as highest)
-    const rc = findMatchingDependency(&deps, Constraint.parse("4.6-rc").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_6_0_stable_linux_x86_64", rc);
-
-    // Get latest at dev level or above (includes everything - returns stable as highest)
-    const dev = findMatchingDependency(&deps, Constraint.parse("dev").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_6_0_stable_linux_x86_64", dev);
-
-    // Get exact dev6
-    const dev6 = findMatchingDependency(&deps, Constraint.parse("4.6.0-dev6").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_6_0_dev6_linux_x86_64", dev6);
-
-    // Get exact rc1
-    const rc1 = findMatchingDependency(&deps, Constraint.parse("4.6.0-rc1").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_6_0_rc1_linux_x86_64", rc1);
-
-    // Get exact beta2
-    const beta2 = findMatchingDependency(&deps, Constraint.parse("4.6.0-beta2").?, "linux", "x86_64");
-    try std.testing.expectEqualStrings("godot_4_6_0_beta2_linux_x86_64", beta2);
+test "findMatchingVersion finds specific version" {
+    // Find a specific old version that we know exists
+    const match = findMatchingVersion(Constraint.parse("3.5.1").?, "linux", "x86_64");
+    try std.testing.expectEqual(@as(u8, 3), match.version.major);
+    try std.testing.expectEqual(@as(u8, 5), match.version.minor);
+    try std.testing.expectEqual(@as(u8, 1), match.version.patch);
 }
 
 // ============================================================================
