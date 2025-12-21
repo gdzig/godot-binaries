@@ -4,9 +4,11 @@ set -euo pipefail
 # Use godot-builds repository which has ALL releases (dev, beta, rc, stable)
 # Pass PAGE=N environment variable to fetch different pages (default: 1)
 # Pass DUMP_ONLY=1 to re-dump headers for all existing versions without downloading
+# Pass GITHUB_TOKEN=<token> to avoid rate limiting
 PAGE="${PAGE:-1}"
 LIMIT="${LIMIT:-5}"
 DUMP_ONLY="${DUMP_ONLY:-}"
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 API_URL="https://api.github.com/repos/godotengine/godot-builds/releases?per_page=${LIMIT}&page=${PAGE}"
 
 mark_lazy() {
@@ -123,7 +125,18 @@ fi
 
 echo "Fetching Godot releases from GitHub (godot-builds)..."
 
-releases=$(curl -s -H "Accept: application/vnd.github.v3+json" "$API_URL")
+if [[ -n "$GITHUB_TOKEN" ]]; then
+  releases=$(curl -s -H "Accept: application/vnd.github.v3+json" -H "Authorization: Bearer $GITHUB_TOKEN" "$API_URL")
+else
+  releases=$(curl -s -H "Accept: application/vnd.github.v3+json" "$API_URL")
+fi
+
+# Check for API errors (rate limiting, etc.)
+if echo "$releases" | jq -e '.message' >/dev/null 2>&1; then
+  echo "Error from GitHub API: $(echo "$releases" | jq -r '.message')" >&2
+  echo "Try setting GITHUB_TOKEN environment variable to avoid rate limiting." >&2
+  exit 1
+fi
 
 # Get existing dependencies from build.zig.zon
 existing=$(grep -oE '\.godot_[a-z0-9_]+' build.zig.zon 2>/dev/null | sed 's/^\.//' | sort -u || echo "")
@@ -172,7 +185,7 @@ echo "$releases" | jq -r '
   .dep_name = "godot_" + (.normalized_version | gsub("\\."; "_")) + "_" + .prerelease + "_" + .platform + "_" + .arch |
   "\(.dep_name) \(.url) \(.normalized_version) \(.prerelease)"
 ' | while read -r dep_name url version prerelease; do
-  if echo "$existing" | grep -qx "$dep_name"; then
+  if grep -qx "$dep_name" <<< "$existing"; then
     echo "  Skipping $dep_name (already exists)"
   else
     echo "  Adding $dep_name..."
