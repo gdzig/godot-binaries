@@ -7,18 +7,28 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const version = b.option([]const u8, "version", "Godot version constraint (default: latest)") orelse "latest";
 
-    if (executable(b, target, version)) |exe_path| {
-        const install = b.addInstallBinFile(exe_path, "godot");
-        b.getInstallStep().dependOn(&install.step);
+    const resolved = executableWithVersion(b, target, version) orelse return;
 
-        const run = std.Build.Step.Run.create(b, "run godot");
-        run.addFileArg(exe_path);
-        if (b.args) |args| run.addArgs(args);
-        run.stdio = .inherit;
+    // Install executable to zig-out/bin/godot
+    const install_exe = b.addInstallBinFile(resolved.exe, "godot");
+    b.getInstallStep().dependOn(&install_exe.step);
 
-        const run_step = b.step("run", "Run Godot");
-        run_step.dependOn(&run.step);
-    }
+    // Install headers to zig-out/include/
+    const headers_dir = headersWithVersion(b, resolved.exe, resolved.version);
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+        .source_dir = headers_dir,
+        .install_dir = .header,
+        .install_subdir = "",
+    }).step);
+
+    // Run step
+    const run = std.Build.Step.Run.create(b, "run godot");
+    run.addFileArg(resolved.exe);
+    if (b.args) |args| run.addArgs(args);
+    run.stdio = .inherit;
+
+    const run_step = b.step("run", "Run Godot");
+    run_step.dependOn(&run.step);
 }
 
 pub const Prerelease = union(enum) {
@@ -335,12 +345,26 @@ fn findExecutable(dep: *std.Build.Dependency) ?std.Build.LazyPath {
     return null;
 }
 
+const MatchedDependency = struct {
+    name: []const u8,
+    version: Version,
+};
+
 fn findMatchingDependency(
     available_deps: []const struct { []const u8, []const u8 },
     constraint: Constraint,
     platform_str: []const u8,
     arch_str: []const u8,
 ) []const u8 {
+    return findMatchingDependencyWithVersion(available_deps, constraint, platform_str, arch_str).name;
+}
+
+fn findMatchingDependencyWithVersion(
+    available_deps: []const struct { []const u8, []const u8 },
+    constraint: Constraint,
+    platform_str: []const u8,
+    arch_str: []const u8,
+) MatchedDependency {
     var best_name: ?[]const u8 = null;
     var best_version: ?Version = null;
 
@@ -362,29 +386,11 @@ fn findMatchingDependency(
         }
     }
 
-    return best_name orelse @panic("No Godot version found matching constraint for this platform/architecture");
-}
-
-fn findMatchingHeadersVersion(
-    available_deps: []const struct { []const u8, []const u8 },
-    constraint: Constraint,
-) Version {
-    var best_version: ?Version = null;
-
-    for (available_deps) |dep| {
-        const name = dep[0];
-        const parsed = parseDependencyName(name) orelse continue;
-
-        // Check version constraint
-        if (!constraint.matches(parsed.version)) continue;
-
-        // Keep the highest matching version
-        if (best_version == null or parsed.version.order(best_version.?) == .gt) {
-            best_version = parsed.version;
-        }
+    if (best_name == null or best_version == null) {
+        @panic("No Godot version found matching constraint for this platform/architecture");
     }
 
-    return best_version orelse @panic("No Godot version found matching constraint");
+    return .{ .name = best_name.?, .version = best_version.? };
 }
 
 fn getSelfDependency(b: *std.Build) *std.Build.Dependency {
@@ -444,34 +450,219 @@ pub fn executable(
     return findExecutable(dep);
 }
 
-/// Get the headers (extension_api.json and gdextension_interface.h) for a Godot version.
+/// Source for the Godot executable used to generate headers.
+pub const HeaderSource = union(enum) {
+    /// Use a Godot version from this package's lazy dependencies.
+    version: []const u8,
+    /// Use a custom Godot executable path.
+    exe: std.Build.LazyPath,
+};
+
+/// Get the headers directory (containing extension_api.json and gdextension_interface.h).
 ///
-/// This does not require downloading the Godot executable - headers are vendored
-/// in this package.
+/// This runs the Godot executable to generate the header files on demand.
 ///
-/// Panics if no matching version exists.
+/// Returns null only while waiting for a lazy dependency to be fetched.
 pub fn headers(
     b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    source: HeaderSource,
+) ?std.Build.LazyPath {
+    const resolved = resolveHeaderSource(b, target, source) orelse return null;
+    return headersWithVersion(b, resolved.exe, resolved.version);
+}
+
+const ResolvedHeaderSource = struct {
+    exe: std.Build.LazyPath,
+    version: ?Version,
+};
+
+fn resolveHeaderSource(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    source: HeaderSource,
+) ?ResolvedHeaderSource {
+    switch (source) {
+        .version => |constraint_str| {
+            const resolved = executableWithVersion(b, target, constraint_str) orelse return null;
+            return .{ .exe = resolved.exe, .version = resolved.version };
+        },
+        .exe => |exe| {
+            // For custom executables, we don't know the version at build time
+            // We'll detect it at runtime
+            return .{ .exe = exe, .version = null };
+        },
+    }
+}
+
+const ExecutableWithVersion = struct {
+    exe: std.Build.LazyPath,
+    version: Version,
+};
+
+/// Internal: get executable and resolved version
+fn executableWithVersion(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
     constraint_str: []const u8,
-) std.Build.LazyPath {
+) ?ExecutableWithVersion {
+    @setEvalBranchQuota(10000);
+
     const constraint = Constraint.parse(constraint_str) orelse
         @panic("Invalid version constraint");
 
-    const godot_builder = getGodotBuilder(b);
-    const version = findMatchingHeadersVersion(godot_builder.available_deps, constraint);
-    const prerelease_str = switch (version.prerelease) {
-        .dev => |n| b.fmt("dev{d}", .{n}),
-        .beta => |n| b.fmt("beta{d}", .{n}),
-        .rc => |n| b.fmt("rc{d}", .{n}),
-        .stable => "stable",
-    };
-    const sub_path = b.fmt("vendor/godot_{d}_{d}_{d}_{s}", .{ version.major, version.minor, version.patch, prerelease_str });
+    const plat = targetToPlatformArch(target.result);
+    const platform_str = platformToString(plat.platform);
+    const arch_str = archToString(plat.arch);
 
-    const dep = getSelfDependency(b);
-    // Get the absolute path by resolving through the directory handle
-    const abs_path = dep.builder.build_root.handle.realpathAlloc(b.allocator, sub_path) catch
-        @panic("Failed to resolve headers path");
-    return .{ .cwd_relative = abs_path };
+    const godot_builder = getGodotBuilder(b);
+    const match = findMatchingDependencyWithVersion(godot_builder.available_deps, constraint, platform_str, arch_str);
+    const dep = godot_builder.lazyDependency(match.name, .{}) orelse return null;
+    const exe_path = findExecutable(dep) orelse return null;
+
+    return .{ .exe = exe_path, .version = match.version };
+}
+
+fn headersWithVersion(
+    b: *std.Build,
+    godot_exe: std.Build.LazyPath,
+    known_version: ?Version,
+) std.Build.LazyPath {
+    if (known_version) |version| {
+        // We know the version at build time, use appropriate flags
+        return headersWithFlags(b, godot_exe, version);
+    } else {
+        // Unknown version (custom exe), use a runtime detection step
+        return headersWithRuntimeDetection(b, godot_exe);
+    }
+}
+
+fn headersWithFlags(
+    b: *std.Build,
+    godot_exe: std.Build.LazyPath,
+    version: Version,
+) std.Build.LazyPath {
+    // Determine flags based on version:
+    // - 4.1.x and 4.2.0-dev[1-5]: --dump-extension-api (no docs)
+    // - 4.2.0-dev6+: --dump-extension-api-with-docs
+    // - 4.6.0-dev5+: also has --dump-gdextension-interface-json
+    const use_docs = shouldUseDocs(version);
+    const has_json_interface = hasJsonInterface(version);
+
+    // Use a shell wrapper to cd into output dir and run godot
+    const run = b.addSystemCommand(&.{ "sh", "-c" });
+
+    var script: std.ArrayListUnmanaged(u8) = .empty;
+    script.appendSlice(b.allocator, "cd \"$1\" && exec \"$2\"") catch @panic("OOM");
+    if (use_docs) {
+        script.appendSlice(b.allocator, " --dump-extension-api-with-docs") catch @panic("OOM");
+    } else {
+        script.appendSlice(b.allocator, " --dump-extension-api") catch @panic("OOM");
+    }
+    script.appendSlice(b.allocator, " --dump-gdextension-interface") catch @panic("OOM");
+    if (has_json_interface) {
+        script.appendSlice(b.allocator, " --dump-gdextension-interface-json") catch @panic("OOM");
+    }
+    script.appendSlice(b.allocator, " --headless --quit") catch @panic("OOM");
+
+    run.addArg(script.items);
+    run.addArg("--");
+    const output_dir = run.addOutputDirectoryArg(".");
+    run.addFileArg(godot_exe);
+
+    return output_dir;
+}
+
+fn headersWithRuntimeDetection(
+    b: *std.Build,
+    godot_exe: std.Build.LazyPath,
+) std.Build.LazyPath {
+    // For unknown versions, run a script that detects and uses appropriate flags
+    // This is a fallback for custom executables
+    const run = b.addSystemCommand(&.{ "sh", "-c" });
+
+    // Shell script that detects version and runs with appropriate flags
+    const script =
+        \\set -e
+        \\GODOT="$1"
+        \\OUTPUT_DIR="$2"
+        \\VERSION=$("$GODOT" --version 2>/dev/null | head -1)
+        \\
+        \\# Parse major.minor from version string (e.g., "4.6.beta2.official" -> "4.6")
+        \\MAJOR=$(echo "$VERSION" | cut -d. -f1)
+        \\MINOR=$(echo "$VERSION" | cut -d. -f2)
+        \\PATCH=$(echo "$VERSION" | cut -d. -f3)
+        \\
+        \\# Determine flags
+        \\API_FLAG="--dump-extension-api-with-docs"
+        \\JSON_FLAG=""
+        \\
+        \\# 4.1.x uses old flag
+        \\if [ "$MAJOR" = "4" ] && [ "$MINOR" = "1" ]; then
+        \\  API_FLAG="--dump-extension-api"
+        \\fi
+        \\
+        \\# 4.2.0-dev[1-5] uses old flag (patch will be "0" and VERSION contains "dev")
+        \\if [ "$MAJOR" = "4" ] && [ "$MINOR" = "2" ] && [ "$PATCH" = "0" ]; then
+        \\  case "$VERSION" in
+        \\    *dev1*|*dev2*|*dev3*|*dev4*|*dev5*) API_FLAG="--dump-extension-api" ;;
+        \\  esac
+        \\fi
+        \\
+        \\# 4.6.0-dev5+ has JSON interface dump
+        \\if [ "$MAJOR" -gt "4" ] || ([ "$MAJOR" = "4" ] && [ "$MINOR" -gt "6" ]); then
+        \\  JSON_FLAG="--dump-gdextension-interface-json"
+        \\elif [ "$MAJOR" = "4" ] && [ "$MINOR" = "6" ]; then
+        \\  case "$VERSION" in
+        \\    *dev[5-9]*|*beta*|*rc*|*stable*) JSON_FLAG="--dump-gdextension-interface-json" ;;
+        \\  esac
+        \\fi
+        \\
+        \\cd "$OUTPUT_DIR"
+        \\exec "$GODOT" $API_FLAG --dump-gdextension-interface $JSON_FLAG --headless --quit
+    ;
+
+    run.addArg(script);
+    run.addArg("--"); // separator
+    run.addFileArg(godot_exe);
+
+    const output_dir = run.addOutputDirectoryArg(".");
+
+    return output_dir;
+}
+
+/// Check if this version should use --dump-extension-api-with-docs
+fn shouldUseDocs(version: Version) bool {
+    // 4.1.x: no docs
+    if (version.major == 4 and version.minor == 1) return false;
+
+    // 4.2.0-dev[1-5]: no docs
+    if (version.major == 4 and version.minor == 2 and version.patch == 0) {
+        switch (version.prerelease) {
+            .dev => |n| return n >= 6,
+            else => return true, // beta, rc, stable all have docs
+        }
+    }
+
+    // Everything else 4.2+ has docs
+    return version.major > 4 or (version.major == 4 and version.minor >= 2);
+}
+
+/// Check if this version has --dump-gdextension-interface-json
+fn hasJsonInterface(version: Version) bool {
+    // Only 4.6.0-dev5 and later
+    if (version.major > 4) return true;
+    if (version.major < 4) return false;
+
+    // major == 4
+    if (version.minor > 6) return true;
+    if (version.minor < 6) return false;
+
+    // major == 4, minor == 6
+    switch (version.prerelease) {
+        .dev => |n| return n >= 5,
+        .beta, .rc, .stable => return true,
+    }
 }
 
 /// Get the dependency for a Godot version (if you need access to other files).
@@ -890,4 +1081,71 @@ test "findMatchingDependency with prerelease filter" {
     // Get latest dev
     const dev = findMatchingDependency(&deps, Constraint.parse("latest-dev").?, "linux", "x86_64");
     try std.testing.expectEqualStrings("godot_4_6_0_dev6_linux_x86_64", dev);
+}
+
+// ============================================================================
+// shouldUseDocs Tests
+// ============================================================================
+
+test "shouldUseDocs 4.1.x returns false" {
+    // 4.1.x never has docs
+    try std.testing.expect(!shouldUseDocs(.{ .major = 4, .minor = 1, .patch = 0, .prerelease = .stable }));
+    try std.testing.expect(!shouldUseDocs(.{ .major = 4, .minor = 1, .patch = 4, .prerelease = .stable }));
+    try std.testing.expect(!shouldUseDocs(.{ .major = 4, .minor = 1, .patch = 0, .prerelease = .{ .beta = 1 } }));
+    try std.testing.expect(!shouldUseDocs(.{ .major = 4, .minor = 1, .patch = 0, .prerelease = .{ .dev = 1 } }));
+}
+
+test "shouldUseDocs 4.2.0-dev[1-5] returns false" {
+    try std.testing.expect(!shouldUseDocs(.{ .major = 4, .minor = 2, .patch = 0, .prerelease = .{ .dev = 1 } }));
+    try std.testing.expect(!shouldUseDocs(.{ .major = 4, .minor = 2, .patch = 0, .prerelease = .{ .dev = 5 } }));
+}
+
+test "shouldUseDocs 4.2.0-dev6+ returns true" {
+    try std.testing.expect(shouldUseDocs(.{ .major = 4, .minor = 2, .patch = 0, .prerelease = .{ .dev = 6 } }));
+    try std.testing.expect(shouldUseDocs(.{ .major = 4, .minor = 2, .patch = 0, .prerelease = .{ .dev = 10 } }));
+}
+
+test "shouldUseDocs 4.2.0-beta+ returns true" {
+    try std.testing.expect(shouldUseDocs(.{ .major = 4, .minor = 2, .patch = 0, .prerelease = .{ .beta = 1 } }));
+    try std.testing.expect(shouldUseDocs(.{ .major = 4, .minor = 2, .patch = 0, .prerelease = .{ .rc = 1 } }));
+    try std.testing.expect(shouldUseDocs(.{ .major = 4, .minor = 2, .patch = 0, .prerelease = .stable }));
+}
+
+test "shouldUseDocs 4.3+ returns true" {
+    try std.testing.expect(shouldUseDocs(.{ .major = 4, .minor = 3, .patch = 0, .prerelease = .stable }));
+    try std.testing.expect(shouldUseDocs(.{ .major = 4, .minor = 5, .patch = 1, .prerelease = .stable }));
+    try std.testing.expect(shouldUseDocs(.{ .major = 4, .minor = 6, .patch = 0, .prerelease = .{ .dev = 1 } }));
+    try std.testing.expect(shouldUseDocs(.{ .major = 5, .minor = 0, .patch = 0, .prerelease = .stable }));
+}
+
+// ============================================================================
+// hasJsonInterface Tests
+// ============================================================================
+
+test "hasJsonInterface before 4.6 returns false" {
+    try std.testing.expect(!hasJsonInterface(.{ .major = 4, .minor = 5, .patch = 1, .prerelease = .stable }));
+    try std.testing.expect(!hasJsonInterface(.{ .major = 4, .minor = 4, .patch = 0, .prerelease = .stable }));
+    try std.testing.expect(!hasJsonInterface(.{ .major = 4, .minor = 1, .patch = 0, .prerelease = .stable }));
+    try std.testing.expect(!hasJsonInterface(.{ .major = 3, .minor = 6, .patch = 0, .prerelease = .stable }));
+}
+
+test "hasJsonInterface 4.6.0-dev[1-4] returns false" {
+    try std.testing.expect(!hasJsonInterface(.{ .major = 4, .minor = 6, .patch = 0, .prerelease = .{ .dev = 1 } }));
+    try std.testing.expect(!hasJsonInterface(.{ .major = 4, .minor = 6, .patch = 0, .prerelease = .{ .dev = 4 } }));
+}
+
+test "hasJsonInterface 4.6.0-dev5+ returns true" {
+    try std.testing.expect(hasJsonInterface(.{ .major = 4, .minor = 6, .patch = 0, .prerelease = .{ .dev = 5 } }));
+    try std.testing.expect(hasJsonInterface(.{ .major = 4, .minor = 6, .patch = 0, .prerelease = .{ .dev = 6 } }));
+}
+
+test "hasJsonInterface 4.6.0-beta+ returns true" {
+    try std.testing.expect(hasJsonInterface(.{ .major = 4, .minor = 6, .patch = 0, .prerelease = .{ .beta = 1 } }));
+    try std.testing.expect(hasJsonInterface(.{ .major = 4, .minor = 6, .patch = 0, .prerelease = .{ .rc = 1 } }));
+    try std.testing.expect(hasJsonInterface(.{ .major = 4, .minor = 6, .patch = 0, .prerelease = .stable }));
+}
+
+test "hasJsonInterface 4.7+ returns true" {
+    try std.testing.expect(hasJsonInterface(.{ .major = 4, .minor = 7, .patch = 0, .prerelease = .stable }));
+    try std.testing.expect(hasJsonInterface(.{ .major = 5, .minor = 0, .patch = 0, .prerelease = .stable }));
 }
