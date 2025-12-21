@@ -495,29 +495,30 @@ fn headersWithFlags(
     const use_docs = shouldUseDocs(version);
     const has_json_interface = hasJsonInterface(version);
 
-    // Use a shell wrapper to cd into output dir and run godot
-    // We need to resolve the godot path before cd'ing since it's relative
-    const run = b.addSystemCommand(&.{ "sh", "-c" });
-    run.step.name = "dump gdextension headers";
+    // Run godot via shell to cd into output dir first
+    // Use Run.create to get proper caching (not addSystemCommand which may not cache)
+    const run = std.Build.Step.Run.create(b, "dump gdextension headers");
+    run.addArg("sh");
+    run.addArg("-c");
 
-    var script: std.ArrayListUnmanaged(u8) = .empty;
-    script.appendSlice(b.allocator, "GODOT=\"$(realpath \"$2\")\" && cd \"$1\" && exec \"$GODOT\"") catch @panic("OOM");
+    // Build the command string - $0 is output dir, $1 is godot path
+    // Resolve godot path to absolute before cd'ing since it may be relative
+    var cmd: std.ArrayListUnmanaged(u8) = .empty;
+    cmd.appendSlice(b.allocator, "GODOT=\"$(realpath \"$1\")\" && cd \"$0\" && exec \"$GODOT\"") catch @panic("OOM");
     if (use_docs) {
-        script.appendSlice(b.allocator, " --dump-extension-api-with-docs") catch @panic("OOM");
+        cmd.appendSlice(b.allocator, " --dump-extension-api-with-docs") catch @panic("OOM");
     } else {
-        script.appendSlice(b.allocator, " --dump-extension-api") catch @panic("OOM");
+        cmd.appendSlice(b.allocator, " --dump-extension-api") catch @panic("OOM");
     }
-    script.appendSlice(b.allocator, " --dump-gdextension-interface") catch @panic("OOM");
+    cmd.appendSlice(b.allocator, " --dump-gdextension-interface") catch @panic("OOM");
     if (has_json_interface) {
-        script.appendSlice(b.allocator, " --dump-gdextension-interface-json") catch @panic("OOM");
+        cmd.appendSlice(b.allocator, " --dump-gdextension-interface-json") catch @panic("OOM");
     }
-    script.appendSlice(b.allocator, " --headless --quit") catch @panic("OOM");
+    cmd.appendSlice(b.allocator, " --headless --quit") catch @panic("OOM");
 
-    run.addArg(script.items);
-    run.addArg("--");
-    const output_dir = run.addOutputDirectoryArg(".");
+    run.addArg(cmd.items);
+    const output_dir = run.addOutputDirectoryArg("headers");
     run.addFileArg(godot_exe);
-    run.step.name = "dump gdextension headers";
 
     return output_dir;
 }
@@ -528,13 +529,16 @@ fn headersWithRuntimeDetection(
 ) std.Build.LazyPath {
     // For unknown versions, run a script that detects and uses appropriate flags
     // This is a fallback for custom executables
-    const run = b.addSystemCommand(&.{ "sh", "-c" });
+    const run = std.Build.Step.Run.create(b, "dump gdextension headers");
+    run.addArg("sh");
+    run.addArg("-c");
 
     // Shell script that detects version and runs with appropriate flags
+    // $0 is the output dir, $1 is the godot executable path
     const script =
         \\set -e
-        \\GODOT="$1"
-        \\OUTPUT_DIR="$2"
+        \\OUTPUT_DIR="$0"
+        \\GODOT="$(realpath "$1")"
         \\VERSION=$("$GODOT" --version 2>/dev/null | head -1)
         \\
         \\# Parse major.minor from version string (e.g., "4.6.beta2.official" -> "4.6")
@@ -572,11 +576,8 @@ fn headersWithRuntimeDetection(
     ;
 
     run.addArg(script);
-    run.addArg("--"); // separator
+    const output_dir = run.addOutputDirectoryArg("headers");
     run.addFileArg(godot_exe);
-
-    const output_dir = run.addOutputDirectoryArg(".");
-    run.step.name = "dump gdextension headers";
 
     return output_dir;
 }
