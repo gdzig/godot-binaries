@@ -116,12 +116,13 @@ fn make(step: *Step, _: Step.MakeOptions) !void {
     }
 
     // Package is stored in <global_cache>/p/<hash>
-    const fetched_path = try std.fs.path.join(arena, &.{ global_cache_path, "p", pkg_hash });
+    // Open relative to global_cache_root.handle to avoid issues with relative paths
+    const pkg_subpath = try std.fs.path.join(arena, &.{ "p", pkg_hash });
 
     // The fetched path is a directory containing the extracted archive
     // Copy contents to our cache directory
-    var src_dir = fs.openDirAbsolute(fetched_path, .{ .iterate = true }) catch |err| {
-        return step.fail("failed to open fetched directory '{s}': {s}", .{ fetched_path, @errorName(err) });
+    var src_dir = b.graph.global_cache_root.handle.openDir(pkg_subpath, .{ .iterate = true }) catch |err| {
+        return step.fail("failed to open fetched directory 'p/{s}': {s}", .{ pkg_hash, @errorName(err) });
     };
     defer src_dir.close();
 
